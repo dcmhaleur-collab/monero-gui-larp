@@ -96,6 +96,12 @@ public:
     QString destinations_formatted() const;
 private:
     explicit TransactionInfo(const Monero::TransactionInfo *pimpl, QObject *parent = 0);
+    TransactionInfo(int direction, quint64 amount, quint64 fee, quint32 subaddrAccount,
+                    const QSet<quint32> &subaddrIndex, const QString &hash, const QString &label,
+                    const QString &paymentId, const QString &description, const QDateTime &timestamp,
+                    bool pending, bool failed, bool coinbase, quint64 blockHeight,
+                    quint64 confirmations, quint64 unlockTime,
+                    const QList<QPair<quint64, QString>> &transfers, QObject *parent = 0);
 private:
     friend class TransactionHistory;
     mutable QList<Transfer*> m_transfers;

@@ -31,6 +31,7 @@
 #include "Transfer.h"
 #include <QDateTime>
 #include <QDebug>
+#include <QPair>
 
 TransactionInfo::Direction TransactionInfo::direction() const
 {
@@ -172,5 +173,36 @@ TransactionInfo::TransactionInfo(const Monero::TransactionInfo *pimpl, QObject *
     for (uint32_t i : pimpl->subaddrIndex())
     {
         m_subaddrIndex.insert(i);
+    }
+}
+
+TransactionInfo::TransactionInfo(int direction, quint64 amount, quint64 fee, quint32 subaddrAccount,
+                                 const QSet<quint32> &subaddrIndex, const QString &hash, const QString &label,
+                                 const QString &paymentId, const QString &description, const QDateTime &timestamp,
+                                 bool pending, bool failed, bool coinbase, quint64 blockHeight,
+                                 quint64 confirmations, quint64 unlockTime,
+                                 const QList<QPair<quint64, QString>> &transfers, QObject *parent)
+    : QObject(parent)
+    , m_amount(amount)
+    , m_blockHeight(blockHeight)
+    , m_confirmations(confirmations)
+    , m_direction(static_cast<Direction>(direction))
+    , m_failed(failed)
+    , m_coinbase(coinbase)
+    , m_fee(fee)
+    , m_hash(hash)
+    , m_label(label)
+    , m_paymentId(paymentId)
+    , m_description(description)
+    , m_pending(pending)
+    , m_subaddrAccount(subaddrAccount)
+    , m_subaddrIndex(subaddrIndex)
+    , m_timestamp(timestamp)
+    , m_unlockTime(unlockTime)
+{
+    for (const auto &t : transfers)
+    {
+        Transfer *transfer = new Transfer(t.first, t.second, this);
+        m_transfers.append(transfer);
     }
 }

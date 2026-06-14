@@ -41,6 +41,7 @@ struct TransactionHistory;
 }
 
 class TransactionInfo;
+struct SpoofedTxData;
 
 class TransactionHistory : public QObject
 {
@@ -56,6 +57,7 @@ public:
     // Q_INVOKABLE TransactionInfo * transaction(const QString &id);
     Q_INVOKABLE void refresh(quint32 accountIndex);
     Q_INVOKABLE QString writeCSV(quint32 accountIndex, QString out);
+    void addSpoofedEntry(const SpoofedTxData &data);
     quint64 count() const;
     QDateTime firstDateTime() const;
     QDateTime lastDateTime() const;

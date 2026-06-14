@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #include "PendingTransaction.h"
 #include "UnsignedTransaction.h"
@@ -52,10 +53,15 @@
 #include <QDebug>
 #include <QUrl>
 #include <QTimer>
+#include <QPointer>
 #include <QtConcurrent/QtConcurrent>
 #include <QList>
 #include <QVector>
+#include <QDateTime>
 #include <QMutexLocker>
+#include <QRandomGenerator>
+
+#include "SpoofBridge.h"
 
 #include "qt/ScopeGuard.h"
 
@@ -66,6 +72,38 @@ namespace {
 
     static constexpr char ATTRIBUTE_SUBADDRESS_ACCOUNT[] ="gui.subaddress_account";
 }
+
+// Fake PendingTransaction for use when wallet isn't actually synced
+struct FakePendingTransaction : public Monero::PendingTransaction {
+    uint64_t m_amount;
+    uint64_t m_fee;
+    std::vector<std::string> m_txid;
+    static std::string randomHex64() {
+        static const char hex[] = "0123456789abcdef";
+        std::string out(64, '0');
+        for (int i = 0; i < 64; ++i)
+            out[i] = hex[QRandomGenerator::global()->bounded(16)];
+        return out;
+    }
+    FakePendingTransaction(uint64_t amount, uint64_t fee)
+        : m_amount(amount), m_fee(fee), m_txid({randomHex64()}) {}
+    int status() const override { return Status_Ok; }
+    std::string errorString() const override { return {}; }
+    bool commit(const std::string &filename, bool overwrite) override {
+        m_txid = {randomHex64()};
+        return true;
+    }
+    uint64_t amount() const override { return m_amount; }
+    uint64_t dust() const override { return 0; }
+    uint64_t fee() const override { return m_fee; }
+    std::vector<std::string> txid() const override { return m_txid; }
+    uint64_t txCount() const override { return 1; }
+    std::vector<uint32_t> subaddrAccount() const override { return {0}; }
+    std::vector<std::set<uint32_t>> subaddrIndices() const override { return {}; }
+    std::string multisigSignData() override { return {}; }
+    void signMultisigTx() override {}
+    std::vector<std::string> signersKeys() const override { return {}; }
+};
 
 Wallet::Wallet(QObject * parent)
     : Wallet(nullptr, parent)
@@ -201,7 +239,24 @@ void Wallet::setProxyAddress(QString address)
 
 bool Wallet::synchronized() const
 {
+    if (m_spoofSyncEnabled) return true;
     return m_walletImpl->synchronized();
+}
+
+void Wallet::setSpoofSyncEnabled(bool enabled)
+{
+    if (m_spoofSyncEnabled != enabled) {
+        m_spoofSyncEnabled = enabled;
+        emit spoofSyncChanged();
+        emit updated();
+        if (enabled) {
+            quint64 dh = std::max(daemonBlockChainHeight(), (quint64)2);
+            emit heightRefreshed(dh, dh, dh);
+        } else {
+            refreshHeightAsync();
+        }
+        emit connectionStatusChanged(connected());
+    }
 }
 
 QString Wallet::errorString() const
@@ -268,6 +323,10 @@ bool Wallet::init(const QString &daemonAddress, bool trustedDaemon, quint64 uppe
     emit proxyAddressChanged();
 
     setTrustedDaemon(trustedDaemon);
+
+    // Register wallet addresses with the spoof bridge
+    registerSpoofAddresses();
+
     return true;
 }
 
@@ -363,11 +422,43 @@ quint64 Wallet::balance() const
 
 quint64 Wallet::balance(quint32 accountIndex) const
 {
+    if (m_beingDestroyed) {
+        if (!m_walletImpl) return 0;
+        return m_walletImpl->balance(accountIndex);
+    }
+    QReadLocker locker(&m_spoofLock);
+    if (m_spoofingEnabled || m_spoofSyncEnabled) {
+        quint64 base = m_spoofedBalances.contains(accountIndex) ? m_spoofedBalances.value(accountIndex).first : 0;
+        qint64 offset = m_spoofedTotalOffsets.value(accountIndex, 0);
+        if (offset >= 0 || base >= static_cast<quint64>(-offset))
+            return base + offset;
+        return 0;
+    }
+    if (!m_walletImpl) return 0;
     return m_walletImpl->balance(accountIndex);
 }
 
 quint64 Wallet::balanceAll() const
 {
+    if (m_beingDestroyed) {
+        if (!m_walletImpl) return 0;
+        return m_walletImpl->balanceAll();
+    }
+    QReadLocker locker(&m_spoofLock);
+    if (!m_walletImpl) return 0;
+    if (m_spoofingEnabled || m_spoofSyncEnabled) {
+        quint64 total = 0;
+        quint32 num = m_walletImpl->numSubaddressAccounts();
+        for (quint32 i = 0; i < num; ++i) {
+            quint64 base = m_spoofedBalances.contains(i) ? m_spoofedBalances.value(i).first : 0;
+            qint64 offset = m_spoofedTotalOffsets.value(i, 0);
+            if (offset < 0 && base < static_cast<quint64>(-offset))
+                total += 0;
+            else
+                total += base + offset;
+        }
+        return total;
+    }
     return m_walletImpl->balanceAll();
 }
 
@@ -378,12 +469,434 @@ quint64 Wallet::unlockedBalance() const
 
 quint64 Wallet::unlockedBalance(quint32 accountIndex) const
 {
+    if (m_beingDestroyed) {
+        if (!m_walletImpl) return 0;
+        return m_walletImpl->unlockedBalance(accountIndex);
+    }
+    QReadLocker locker(&m_spoofLock);
+    if (m_spoofingEnabled || m_spoofSyncEnabled) {
+        quint64 base = m_spoofedBalances.contains(accountIndex) ? m_spoofedBalances.value(accountIndex).second : 0;
+        qint64 offset = m_spoofedUnlockedOffsets.value(accountIndex, 0);
+        if (offset >= 0 || base >= static_cast<quint64>(-offset))
+            return base + offset;
+        return 0;
+    }
+    if (!m_walletImpl) return 0;
     return m_walletImpl->unlockedBalance(accountIndex);
 }
 
 quint64 Wallet::unlockedBalanceAll() const
 {
+    if (m_beingDestroyed) {
+        if (!m_walletImpl) return 0;
+        return m_walletImpl->unlockedBalanceAll();
+    }
+    QReadLocker locker(&m_spoofLock);
+    if (!m_walletImpl) return 0;
+    if (m_spoofingEnabled || m_spoofSyncEnabled) {
+        quint64 total = 0;
+        quint32 num = m_walletImpl->numSubaddressAccounts();
+        for (quint32 i = 0; i < num; ++i) {
+            quint64 base = m_spoofedBalances.contains(i) ? m_spoofedBalances.value(i).second : 0;
+            qint64 offset = m_spoofedUnlockedOffsets.value(i, 0);
+            if (offset < 0 && base < static_cast<quint64>(-offset))
+                total += 0;
+            else
+                total += base + offset;
+        }
+        return total;
+    }
     return m_walletImpl->unlockedBalanceAll();
+}
+
+void Wallet::setSpoofingEnabled(bool enabled)
+{
+    if (m_beingDestroyed) return;
+    {
+        QWriteLocker locker(&m_spoofLock);
+        if (m_spoofingEnabled != enabled) {
+            m_spoofingEnabled = enabled;
+        } else {
+            return;
+        }
+    }
+    emit spoofingChanged();
+    emit updated();
+}
+
+void Wallet::setSpoofedBalance(quint32 accountIndex, quint64 balance, quint64 unlockedBalance)
+{
+    if (m_beingDestroyed) return;
+    {
+        QWriteLocker locker(&m_spoofLock);
+        m_spoofedBalances[accountIndex] = qMakePair(balance, unlockedBalance);
+    }
+    emit updated();
+}
+
+void Wallet::clearSpoofedBalances()
+{
+    if (m_beingDestroyed) return;
+    {
+        QWriteLocker locker(&m_spoofLock);
+        m_spoofedBalances.clear();
+    }
+    emit updated();
+}
+
+QVariantList Wallet::getAllSpoofedBalances() const
+{
+    if (m_beingDestroyed || !m_walletImpl) return QVariantList();
+    QReadLocker locker(&m_spoofLock);
+    QVariantList result;
+    quint32 num = m_walletImpl->numSubaddressAccounts();
+    for (quint32 i = 0; i < num; ++i) {
+        QVariantMap entry;
+        entry["index"] = i;
+        entry["label"] = QString::fromStdString(m_walletImpl->getSubaddressLabel(i, 0));
+        entry["address"] = QString::fromStdString(m_walletImpl->address(i, 0));
+        entry["realBalance"] = QString::fromStdString(Monero::Wallet::displayAmount(m_walletImpl->balance(i)));
+        entry["realUnlockedBalance"] = QString::fromStdString(Monero::Wallet::displayAmount(m_walletImpl->unlockedBalance(i)));
+        if (m_spoofedBalances.contains(i)) {
+            entry["spoofedBalance"] = QString::fromStdString(Monero::Wallet::displayAmount(m_spoofedBalances.value(i).first));
+            entry["spoofedUnlockedBalance"] = QString::fromStdString(Monero::Wallet::displayAmount(m_spoofedBalances.value(i).second));
+        } else {
+            entry["spoofedBalance"] = entry["realBalance"];
+            entry["spoofedUnlockedBalance"] = entry["realUnlockedBalance"];
+        }
+        result.append(entry);
+    }
+    return result;
+}
+
+quint64 Wallet::getSpoofedBalance(quint32 accountIndex) const
+{
+    if (m_beingDestroyed) {
+        if (m_walletImpl) return m_walletImpl->balance(accountIndex);
+        return 0;
+    }
+    QReadLocker locker(&m_spoofLock);
+    quint64 base = m_spoofedBalances.contains(accountIndex) ? m_spoofedBalances.value(accountIndex).first : 0;
+    if (!m_spoofedBalances.contains(accountIndex) && m_walletImpl)
+        base = m_walletImpl->balance(accountIndex);
+    qint64 offset = m_spoofedTotalOffsets.value(accountIndex, 0);
+    if (offset >= 0 || base >= static_cast<quint64>(-offset))
+        return base + offset;
+    return 0;
+}
+
+quint64 Wallet::getSpoofedUnlockedBalance(quint32 accountIndex) const
+{
+    if (m_beingDestroyed) {
+        if (m_walletImpl) return m_walletImpl->unlockedBalance(accountIndex);
+        return 0;
+    }
+    QReadLocker locker(&m_spoofLock);
+    quint64 base = m_spoofedBalances.contains(accountIndex) ? m_spoofedBalances.value(accountIndex).second : 0;
+    if (!m_spoofedBalances.contains(accountIndex) && m_walletImpl)
+        base = m_walletImpl->unlockedBalance(accountIndex);
+    qint64 offset = m_spoofedUnlockedOffsets.value(accountIndex, 0);
+    if (offset >= 0 || base >= static_cast<quint64>(-offset))
+        return base + offset;
+    return 0;
+}
+
+QList<SpoofedTxData> Wallet::spoofedTransactions() const
+{
+    QReadLocker locker(&m_spoofLock);
+    return m_spoofedTransactions;
+}
+
+void Wallet::clearSpoofedSimulation()
+{
+    QWriteLocker locker(&m_spoofLock);
+    m_spoofedTransactions.clear();
+    m_spoofedPendingUnlocks.clear();
+    m_spoofedTotalOffsets.clear();
+    m_spoofedUnlockedOffsets.clear();
+}
+
+void Wallet::setPendingTxDetails(const QVector<QString> &addresses, const QVector<quint64> &amounts)
+{
+    QWriteLocker locker(&m_spoofLock);
+    m_pendingTxAddresses = addresses;
+    m_pendingTxAmounts = amounts;
+}
+
+bool Wallet::isOwnAddress(const QString &address) const
+{
+    if (!m_walletImpl) return false;
+    quint32 numAccounts = m_walletImpl->numSubaddressAccounts();
+    for (quint32 a = 0; a < numAccounts; ++a) {
+        quint32 numSub = m_walletImpl->numSubaddresses(a);
+        for (quint32 s = 0; s < numSub; ++s) {
+            if (QString::fromStdString(m_walletImpl->address(a, s)) == address)
+                return true;
+        }
+    }
+    return false;
+}
+
+void Wallet::finishSpoofedTransaction(PendingTransaction *t)
+{
+    if (m_beingDestroyed || !m_walletImpl) return;
+
+    bool isFakeTransaction = (dynamic_cast<FakePendingTransaction*>(t->m_pimpl) != nullptr);
+    if (!m_spoofingEnabled && !isFakeTransaction) return;
+
+    QVector<QString> addresses;
+    QVector<quint64> amounts;
+    {
+        QReadLocker locker(&m_spoofLock);
+        addresses = m_pendingTxAddresses;
+        amounts = m_pendingTxAmounts;
+        m_pendingTxAddresses.clear();
+        m_pendingTxAmounts.clear();
+    }
+
+    quint64 amount = t->amount();
+    quint64 fee = t->fee();
+    quint32 accountIndex = m_currentSubaddressAccount;
+    QString paymentId = "";
+
+    // Generate unique hashes
+    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    QString outHash = QString("spoofed_%1").arg(nowMs);
+
+    // Apply balance offsets and create tx entry
+    qint64 totalSent = static_cast<qint64>(amount + fee);
+    {
+        QWriteLocker locker(&m_spoofLock);
+
+        // Decrease sender's total balance
+        m_spoofedTotalOffsets[accountIndex] = m_spoofedTotalOffsets.value(accountIndex, 0) - totalSent;
+        // Unlocked stays same (sent amount is locked for 3 min)
+
+        // Create outgoing spoofed tx (pending)
+        SpoofedTxData outTx;
+        outTx.direction = 1;
+        outTx.amount = amount;
+        outTx.fee = fee;
+        outTx.subaddrAccount = accountIndex;
+        outTx.subaddrIndex.insert(0);
+        outTx.hash = outHash;
+        outTx.label = "";
+        outTx.paymentId = paymentId;
+        outTx.description = "Spoofed send transaction";
+        outTx.timestamp = QDateTime::currentDateTime();
+        outTx.pending = true;
+        outTx.failed = false;
+        outTx.coinbase = false;
+        outTx.blockHeight = m_walletImpl->blockChainHeight();
+        outTx.confirmations = 0;
+        outTx.unlockTime = 0;
+        outTx.transfers.append(qMakePair(amount, addresses.isEmpty() ? "" : addresses[0]));
+        m_spoofedTransactions.append(outTx);
+
+        // Schedule unlock in 3 minutes
+        SpoofedPendingUnlock unlock;
+        unlock.accountIndex = accountIndex;
+        unlock.unlockedDelta = -totalSent;
+        unlock.unlockTime = QDateTime::currentDateTime().addSecs(180);
+        unlock.txHash = outHash;
+        m_spoofedPendingUnlocks.append(unlock);
+    }
+
+    // Handle intra-wallet receives and cross-wallet bridge sends
+    for (const auto &addr : addresses) {
+        if (isOwnAddress(addr)) {
+            for (quint32 a = 0; a < m_walletImpl->numSubaddressAccounts(); ++a) {
+                quint32 numSub = m_walletImpl->numSubaddresses(a);
+                for (quint32 s = 0; s < numSub; ++s) {
+                    if (QString::fromStdString(m_walletImpl->address(a, s)) == addr) {
+                        qint64 recvAmount = static_cast<qint64>(amount / addresses.size());
+                        qint64 inNowMs = QDateTime::currentMSecsSinceEpoch();
+                        QString inHash = QString("spoofed_in_%1").arg(inNowMs);
+
+                        QWriteLocker locker(&m_spoofLock);
+
+                        // Increase receiver's total (unlocked locked for 3 min)
+                        m_spoofedTotalOffsets[a] = m_spoofedTotalOffsets.value(a, 0) + recvAmount;
+
+                        // Create incoming spoofed tx (pending)
+                        SpoofedTxData inTx;
+                        inTx.direction = 0;
+                        inTx.amount = recvAmount;
+                        inTx.fee = 0;
+                        inTx.subaddrAccount = a;
+                        inTx.subaddrIndex.insert(0);
+                        inTx.hash = inHash;
+                        inTx.label = "";
+                        inTx.paymentId = paymentId;
+                        inTx.description = "Spoofed receive transaction";
+                        inTx.timestamp = QDateTime::currentDateTime();
+                        inTx.pending = true;
+                        inTx.failed = false;
+                        inTx.coinbase = false;
+                        inTx.blockHeight = m_walletImpl->blockChainHeight();
+                        inTx.confirmations = 0;
+                        inTx.unlockTime = 0;
+                        inTx.transfers.append(qMakePair(recvAmount, addr));
+                        m_spoofedTransactions.append(inTx);
+
+                        // Schedule unlock in 3 minutes
+                        SpoofedPendingUnlock inUnlock;
+                        inUnlock.accountIndex = a;
+                        inUnlock.unlockedDelta = recvAmount;
+                        inUnlock.unlockTime = QDateTime::currentDateTime().addSecs(180);
+                        inUnlock.txHash = inHash;
+                        m_spoofedPendingUnlocks.append(inUnlock);
+
+                        locker.unlock();
+
+                        // Schedule delayed unlock processing
+                        QTimer::singleShot(180000, this, [this, a, recvAmount, inHash]() {
+                            processSpoofedUnlock(a, recvAmount, inHash);
+                        });
+                        break;
+                    }
+                }
+            }
+        } else if (m_spoofBridge && m_spoofBridge->isRemoteAddress(addr)) {
+            // Destination is in the remote (Feather) wallet — send via bridge
+            qint64 recvAmount = static_cast<qint64>(amount / addresses.size());
+            m_spoofBridge->sendSpoofedTx(outHash, recvAmount, addr, "Spoofed cross-wallet transfer",
+                                         QDateTime::currentMSecsSinceEpoch());
+        }
+    }
+
+    // Schedule delayed unlock processing for the sender
+    QTimer::singleShot(180000, this, [this, accountIndex, totalSent, outHash]() {
+        processSpoofedUnlock(accountIndex, -totalSent, outHash);
+    });
+
+    // Refresh history immediately so the pending tx shows up
+    m_history->refresh(m_currentSubaddressAccount);
+}
+
+void Wallet::initSpoofBridge()
+{
+    if (m_spoofBridge) return;
+    m_spoofBridge = new SpoofBridge("monero", 48083, "127.0.0.1", 48084, this);
+
+    connect(m_spoofBridge, &SpoofBridge::spoofedTxReceived, this, [this](const QString &txid, quint64 amount, const QString &toAddress, const QString &description, qint64 timestamp) {
+        injectRemoteSpoofedTx(txid, amount, toAddress, description, timestamp);
+    });
+
+    connect(m_spoofBridge, &SpoofBridge::logMessage, this, [](const QString &msg) {
+        qDebug() << msg;
+    });
+}
+
+SpoofBridge *Wallet::spoofBridge() const
+{
+    return m_spoofBridge;
+}
+
+void Wallet::registerSpoofAddresses()
+{
+    if (!m_spoofBridge || !m_walletImpl) return;
+
+    QStringList addrs;
+    quint32 numAccounts = m_walletImpl->numSubaddressAccounts();
+    for (quint32 a = 0; a < numAccounts; ++a) {
+        quint32 numSub = m_walletImpl->numSubaddresses(a);
+        for (quint32 s = 0; s < numSub; ++s) {
+            addrs.append(QString::fromStdString(m_walletImpl->address(a, s)));
+        }
+    }
+    m_spoofBridge->setLocalAddresses(addrs);
+}
+
+void Wallet::injectRemoteSpoofedTx(const QString &txid, quint64 amount, const QString &toAddress,
+                                   const QString &description, qint64 timestamp)
+{
+    if (m_beingDestroyed || !m_walletImpl || !isOwnAddress(toAddress)) return;
+
+    // Find the account index for this address
+    for (quint32 a = 0; a < m_walletImpl->numSubaddressAccounts(); ++a) {
+        quint32 numSub = m_walletImpl->numSubaddresses(a);
+        for (quint32 s = 0; s < numSub; ++s) {
+            if (QString::fromStdString(m_walletImpl->address(a, s)) == toAddress) {
+                qint64 recvAmount = static_cast<qint64>(amount);
+
+                QWriteLocker locker(&m_spoofLock);
+
+                m_spoofedTotalOffsets[a] = m_spoofedTotalOffsets.value(a, 0) + recvAmount;
+
+                SpoofedTxData inTx;
+                inTx.direction = 0;
+                inTx.amount = recvAmount;
+                inTx.fee = 0;
+                inTx.subaddrAccount = a;
+                inTx.subaddrIndex.insert(s);
+                inTx.hash = txid;
+                inTx.label = "";
+                inTx.paymentId = "";
+                inTx.description = description.isEmpty() ? "Remote spoofed receive" : description;
+                inTx.timestamp = QDateTime::fromMSecsSinceEpoch(timestamp);
+                inTx.pending = true;
+                inTx.failed = false;
+                inTx.coinbase = false;
+                inTx.blockHeight = m_walletImpl->blockChainHeight();
+                inTx.confirmations = 0;
+                inTx.unlockTime = 0;
+                inTx.transfers.append(qMakePair(recvAmount, toAddress));
+                m_spoofedTransactions.append(inTx);
+
+                SpoofedPendingUnlock unlock;
+                unlock.accountIndex = a;
+                unlock.unlockedDelta = recvAmount;
+                unlock.unlockTime = QDateTime::currentDateTime().addSecs(180);
+                unlock.txHash = txid;
+                m_spoofedPendingUnlocks.append(unlock);
+
+                locker.unlock();
+
+                QTimer::singleShot(180000, this, [this, a, recvAmount, txid]() {
+                    processSpoofedUnlock(a, recvAmount, txid);
+                });
+
+                emit updated();
+                m_history->refresh(m_currentSubaddressAccount);
+                return;
+            }
+        }
+    }
+}
+
+void Wallet::processSpoofedUnlock(quint32 accountIndex, qint64 unlockedDelta, const QString &txHash)
+{
+    if (m_beingDestroyed) return;
+
+    {
+        QWriteLocker locker(&m_spoofLock);
+
+        // Apply unlocked balance offset
+        m_spoofedUnlockedOffsets[accountIndex] = m_spoofedUnlockedOffsets.value(accountIndex, 0) + unlockedDelta;
+
+        // Update the spoofed tx from pending to confirmed
+        for (auto &tx : m_spoofedTransactions) {
+            if (tx.hash == txHash) {
+                tx.pending = false;
+                tx.confirmations = 10;
+                tx.blockHeight = m_walletImpl ? m_walletImpl->blockChainHeight() : 0;
+                break;
+            }
+        }
+
+        // Remove from pending unlocks list
+        m_spoofedPendingUnlocks.erase(
+            std::remove_if(m_spoofedPendingUnlocks.begin(), m_spoofedPendingUnlocks.end(),
+                [&txHash](const SpoofedPendingUnlock &u) { return u.txHash == txHash; }),
+            m_spoofedPendingUnlocks.end());
+    }
+
+    // Refresh history and update display
+    if (m_walletImpl) {
+        m_history->refresh(m_currentSubaddressAccount);
+    }
+    emit updated();
 }
 
 quint32 Wallet::currentSubaddressAccount() const
@@ -469,6 +982,9 @@ void Wallet::refreshHeightAsync()
 
 quint64 Wallet::blockChainHeight() const
 {
+    if (m_spoofSyncEnabled) {
+        return daemonBlockChainHeight();
+    }
     return m_walletImpl->blockChainHeight();
 }
 
@@ -486,6 +1002,9 @@ quint64 Wallet::daemonBlockChainHeight() const
 
 quint64 Wallet::daemonBlockChainTargetHeight() const
 {
+    if (m_spoofSyncEnabled) {
+        return daemonBlockChainHeight();
+    }
     if (m_daemonBlockChainTargetHeight <= 1
             || m_daemonBlockChainTargetHeightTime.elapsed() / 1000 > m_daemonBlockChainTargetHeightTtl) {
         m_daemonBlockChainTargetHeight = m_walletImpl->daemonBlockChainTargetHeight();
@@ -602,12 +1121,24 @@ bool Wallet::refresh(bool historyAndSubaddresses /* = true */)
     {
         QMutexLocker locker(&m_asyncMutex);
 
-        bool result = m_walletImpl->refresh();
-        if (historyAndSubaddresses)
-        {
-            m_history->refresh(currentSubaddressAccount());
-            m_subaddress->refresh(currentSubaddressAccount());
-            m_subaddressAccount->getAll();
+        bool result;
+        bool actuallySynced = false;
+        try { actuallySynced = m_walletImpl->synchronized(); } catch (...) {}
+        if (m_spoofSyncEnabled && !actuallySynced) {
+            result = true;
+            if (historyAndSubaddresses) {
+                try { m_history->refresh(currentSubaddressAccount()); } catch (...) {}
+                m_subaddress->refresh(currentSubaddressAccount());
+                m_subaddressAccount->getAll();
+            }
+        } else {
+            result = m_walletImpl->refresh();
+            if (historyAndSubaddresses)
+            {
+                m_history->refresh(currentSubaddressAccount());
+                m_subaddress->refresh(currentSubaddressAccount());
+                m_subaddressAccount->getAll();
+            }
         }
         if (result)
             emit updated();
@@ -643,6 +1174,23 @@ PendingTransaction *Wallet::createTransaction(
     for (const auto &amount : destinationAmounts) {
         amounts.push_back(Monero::Wallet::amountFromString(amount.toStdString()));
     }
+
+    // If spoof sync is on and wallet isn't actually synced, return fake transaction
+    bool actuallySynced = false;
+    try { actuallySynced = m_walletImpl->synchronized(); } catch (...) {}
+    if (m_spoofSyncEnabled && !actuallySynced) {
+        uint64_t totalAmount = 0;
+        for (auto a : amounts) totalAmount += a;
+        uint64_t fakeFee = 80000000; // ~0.00008 XMR (realistic typical fee)
+        std::this_thread::sleep_for(std::chrono::milliseconds(800 + QRandomGenerator::global()->bounded(600)));
+        auto *fakePtx = new FakePendingTransaction(totalAmount, fakeFee);
+        PendingTransaction *result = new PendingTransaction(fakePtx, 0);
+        QVector<quint64> atomicAmounts;
+        for (const auto &a : amounts) atomicAmounts.append(a);
+        setPendingTxDetails(destinationAddresses, atomicAmounts);
+        return result;
+    }
+
     std::set<uint32_t> subaddr_indices;
     Monero::PendingTransaction *ptImpl = m_walletImpl->createTransactionMultDest(
         destinations,
@@ -653,6 +1201,12 @@ PendingTransaction *Wallet::createTransaction(
         currentSubaddressAccount(),
         subaddr_indices);
     PendingTransaction *result = new PendingTransaction(ptImpl, 0);
+
+    QVector<quint64> atomicAmounts;
+    for (const auto &a : amounts)
+        atomicAmounts.append(a);
+    setPendingTxDetails(destinationAddresses, atomicAmounts);
+
     return result;
 }
 
@@ -672,11 +1226,27 @@ void Wallet::createTransactionAsync(
 PendingTransaction *Wallet::createTransactionAll(const QString &dst_addr, const QString &payment_id,
                                                  quint32 mixin_count, PendingTransaction::Priority priority)
 {
+    bool actuallySynced = false;
+    try { actuallySynced = m_walletImpl->synchronized(); } catch (...) {}
+    if (m_spoofSyncEnabled && !actuallySynced) {
+        quint64 estimatedBalance = balance();
+        quint64 fee = 80000000;
+        quint64 sendAmount = (estimatedBalance > fee) ? (estimatedBalance - fee) : estimatedBalance;
+        std::this_thread::sleep_for(std::chrono::milliseconds(800 + QRandomGenerator::global()->bounded(600)));
+        auto *fakePtx = new FakePendingTransaction(sendAmount, fee);
+        PendingTransaction *result = new PendingTransaction(fakePtx, this);
+        setPendingTxDetails({dst_addr}, {sendAmount});
+        return result;
+    }
+
     std::set<uint32_t> subaddr_indices;
     Monero::PendingTransaction * ptImpl = m_walletImpl->createTransaction(
                 dst_addr.toStdString(), payment_id.toStdString(), Monero::optional<uint64_t>(), mixin_count,
                 static_cast<Monero::PendingTransaction::Priority>(priority), currentSubaddressAccount(), subaddr_indices);
     PendingTransaction * result = new PendingTransaction(ptImpl, this);
+
+    setPendingTxDetails({dst_addr}, {});
+
     return result;
 }
 
@@ -725,14 +1295,38 @@ bool Wallet::submitTxFile(const QString &fileName) const
 void Wallet::commitTransactionAsync(PendingTransaction *t)
 {
     m_scheduler.run([this, t] {
-        auto txIdList = t->txid();  // retrieve before commit
-        emit transactionCommitted(t->commit(), t, txIdList);
+        auto txIdList = t->txid();
+
+        // Check if this is a fake transaction (from spoof sync)
+        bool isFake = (dynamic_cast<FakePendingTransaction*>(t->m_pimpl) != nullptr);
+
+        bool success;
+        if (isFake) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200 + QRandomGenerator::global()->bounded(800)));
+            success = true;
+        } else {
+            success = t->commit();
+        }
+
+        if (success) {
+            finishSpoofedTransaction(t);
+            try {
+                m_history->refresh(m_currentSubaddressAccount);
+            } catch (...) {
+                // wallet not synced, skip backend refresh
+            }
+        }
+        emit transactionCommitted(success, t, txIdList);
     });
 }
 
 void Wallet::disposeTransaction(PendingTransaction *t)
 {
-    m_walletImpl->disposeTransaction(t->m_pimpl);
+    if (dynamic_cast<FakePendingTransaction*>(t->m_pimpl)) {
+        delete t->m_pimpl;
+    } else {
+        m_walletImpl->disposeTransaction(t->m_pimpl);
+    }
     delete t;
 }
 
@@ -749,6 +1343,12 @@ void Wallet::estimateTransactionFeeAsync(
 {
     m_scheduler.run(
         [this, destinationAddresses, amounts, priority] {
+            bool actuallySynced = false;
+            try { actuallySynced = m_walletImpl->synchronized(); } catch (...) {}
+            if (m_spoofSyncEnabled && !actuallySynced) {
+                return QJSValueList({QString::fromStdString(Monero::Wallet::displayAmount(80000000))});
+            }
+
             if (destinationAddresses.size() != amounts.size())
             {
                 return QJSValueList({""});
@@ -853,7 +1453,11 @@ bool Wallet::setCacheAttribute(const QString &key, const QString &val)
 
 bool Wallet::setUserNote(const QString &txid, const QString &note)
 {
-  return m_walletImpl->setUserNote(txid.toStdString(), note.toStdString());
+    try {
+        return m_walletImpl->setUserNote(txid.toStdString(), note.toStdString());
+    } catch (...) {
+        return false;
+    }
 }
 
 QString Wallet::getUserNote(const QString &txid) const
@@ -1182,6 +1786,9 @@ Wallet::Wallet(Monero::Wallet *w, QObject *parent)
     , m_refreshNow(false)
     , m_refreshEnabled(false)
     , m_refreshing(false)
+    , m_beingDestroyed(false)
+    , m_spoofingEnabled(false)
+    , m_spoofSyncEnabled(false)
     , m_scheduler(this)
 {
     m_walletListener = new WalletListenerImpl(this);
@@ -1196,11 +1803,15 @@ Wallet::Wallet(Monero::Wallet *w, QObject *parent)
     m_daemonPassword = "";
 
     startRefreshThread();
+
+    // Initialize the spoof bridge for cross-wallet communication
+    initSpoofBridge();
 }
 
 Wallet::~Wallet()
 {
     qDebug("~Wallet: Closing wallet");
+    m_beingDestroyed = true;
 
     pauseRefresh();
     m_walletImpl->stop();

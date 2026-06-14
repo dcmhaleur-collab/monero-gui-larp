@@ -28,6 +28,8 @@
 
 #include "TransactionHistory.h"
 #include "TransactionInfo.h"
+#include "Wallet.h"
+#include "Wallet.h"
 #include <wallet/api/wallet2_api.h>
 
 #include <QFile>
@@ -103,6 +105,25 @@ void TransactionHistory::refresh(quint32 accountIndex)
                 m_locked = true;
             }
         }
+
+        Wallet *wallet = qobject_cast<Wallet*>(parent());
+        if (wallet && wallet->showSpoofedTransactions()) {
+            for (const auto &sd : wallet->spoofedTransactions()) {
+                if (sd.subaddrAccount != accountIndex)
+                    continue;
+                TransactionInfo *sti = new TransactionInfo(
+                    sd.direction, sd.amount, sd.fee, sd.subaddrAccount,
+                    sd.subaddrIndex, sd.hash, sd.label,
+                    sd.paymentId, sd.description, sd.timestamp,
+                    sd.pending, sd.failed, sd.coinbase, sd.blockHeight,
+                    sd.confirmations, sd.unlockTime, sd.transfers, this);
+                m_tinfo.append(sti);
+                if (sti->timestamp() >= lastDateTime)
+                    lastDateTime = sti->timestamp();
+                if (sti->timestamp() <= firstDateTime)
+                    firstDateTime = sti->timestamp();
+            }
+        }
     }
 
     emit refreshFinished();
@@ -154,6 +175,22 @@ TransactionHistory::TransactionHistory(Monero::TransactionHistory *pimpl, QObjec
     m_firstDateTime  = QDateTime(QDate(2014, 4, 18)); // the genesis block
 #endif
     m_lastDateTime = QDateTime::currentDateTime().addDays(1); // tomorrow (guard against jitter and timezones)
+}
+
+void TransactionHistory::addSpoofedEntry(const SpoofedTxData &data)
+{
+    QWriteLocker locker(&m_lock);
+    TransactionInfo *tx = new TransactionInfo(
+        data.direction, data.amount, data.fee, data.subaddrAccount,
+        data.subaddrIndex, data.hash, data.label,
+        data.paymentId, data.description, data.timestamp,
+        data.pending, data.failed, data.coinbase, data.blockHeight,
+        data.confirmations, data.unlockTime, data.transfers, this);
+    m_tinfo.append(tx);
+    if (tx->timestamp() >= m_lastDateTime)
+        m_lastDateTime = tx->timestamp();
+    if (tx->timestamp() <= m_firstDateTime)
+        m_firstDateTime = tx->timestamp();
 }
 
 QString TransactionHistory::writeCSV(quint32 accountIndex, QString out)

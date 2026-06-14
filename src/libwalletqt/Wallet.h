@@ -35,6 +35,11 @@
 #include <QObject>
 #include <QMutex>
 #include <QList>
+#include <QMap>
+#include <QPair>
+#include <QSet>
+#include <QDateTime>
+#include <QReadWriteLock>
 #include <QJSValue>
 #include <QtConcurrent/QtConcurrent>
 
@@ -60,6 +65,35 @@ class Subaddress;
 class SubaddressModel;
 class SubaddressAccount;
 class SubaddressAccountModel;
+class Transfer;
+class SpoofBridge;
+
+struct SpoofedTxData {
+    int direction; // 0=In, 1=Out
+    quint64 amount;
+    quint64 fee;
+    quint32 subaddrAccount;
+    QSet<quint32> subaddrIndex;
+    QString hash;
+    QString label;
+    QString paymentId;
+    QString description;
+    QDateTime timestamp;
+    bool pending;
+    bool failed;
+    bool coinbase;
+    quint64 blockHeight;
+    quint64 confirmations;
+    quint64 unlockTime;
+    QList<QPair<quint64, QString>> transfers; // amount + address pairs
+};
+
+struct SpoofedPendingUnlock {
+    quint32 accountIndex;
+    qint64 unlockedDelta;  // how much unlocked balance changes when this unlocks
+    QDateTime unlockTime;
+    QString txHash;  // links to the spoofed tx to update
+};
 
 class Wallet : public QObject, public PassprasePrompter
 {
@@ -73,6 +107,7 @@ class Wallet : public QObject, public PassprasePrompter
 //    Q_PROPERTY(ConnectionStatus connected READ connected)
     Q_PROPERTY(quint32 currentSubaddressAccount READ currentSubaddressAccount NOTIFY currentSubaddressAccountChanged)
     Q_PROPERTY(bool synchronized READ synchronized)
+    Q_PROPERTY(bool spoofSyncEnabled READ isSpoofSyncEnabled WRITE setSpoofSyncEnabled NOTIFY spoofSyncChanged)
     Q_PROPERTY(QString errorString READ errorString)
     Q_PROPERTY(TransactionHistory * history READ history)
     Q_PROPERTY(TransactionHistorySortFilterModel * historyModel READ historyModel NOTIFY historyModelChanged)
@@ -91,6 +126,7 @@ class Wallet : public QObject, public PassprasePrompter
     Q_PROPERTY(QString daemonLogPath READ getDaemonLogPath CONSTANT)
     Q_PROPERTY(QString proxyAddress READ getProxyAddress WRITE setProxyAddress NOTIFY proxyAddressChanged)
     Q_PROPERTY(quint64 walletCreationHeight READ getWalletCreationHeight WRITE setWalletCreationHeight NOTIFY walletCreationHeightChanged)
+    Q_PROPERTY(bool spoofingEnabled READ isSpoofingEnabled WRITE setSpoofingEnabled NOTIFY spoofingChanged)
 
 public:
 
@@ -201,6 +237,33 @@ public:
     Q_INVOKABLE QString getSubaddressLabel(quint32 accountIndex, quint32 addressIndex) const;
     Q_INVOKABLE void setSubaddressLabel(quint32 accountIndex, quint32 addressIndex, const QString &label);
     Q_INVOKABLE void deviceShowAddressAsync(quint32 accountIndex, quint32 addressIndex, const QString &paymentId);
+
+    //! balance spoofing
+    Q_INVOKABLE bool isSpoofingEnabled() const { return m_spoofingEnabled; }
+    Q_INVOKABLE void setSpoofingEnabled(bool enabled);
+    Q_INVOKABLE bool isSpoofSyncEnabled() const { return m_spoofSyncEnabled; }
+    Q_INVOKABLE void setSpoofSyncEnabled(bool enabled);
+    Q_INVOKABLE void setSpoofedBalance(quint32 accountIndex, quint64 balance, quint64 unlockedBalance);
+    Q_INVOKABLE void clearSpoofedBalances();
+    Q_INVOKABLE QVariantList getAllSpoofedBalances() const;
+    Q_INVOKABLE quint64 getSpoofedBalance(quint32 accountIndex) const;
+    Q_INVOKABLE quint64 getSpoofedUnlockedBalance(quint32 accountIndex) const;
+
+    //! spoofed transaction simulation
+    Q_INVOKABLE void setPendingTxDetails(const QVector<QString> &addresses, const QVector<quint64> &amounts);
+    Q_INVOKABLE void finishSpoofedTransaction(PendingTransaction *t);
+    Q_INVOKABLE void clearSpoofedSimulation();
+    void processSpoofedUnlock(quint32 accountIndex, qint64 unlockedDelta, const QString &txHash);
+    bool isOwnAddress(const QString &address) const;
+    QList<SpoofedTxData> spoofedTransactions() const;
+    bool showSpoofedTransactions() const { return m_spoofingEnabled || m_spoofSyncEnabled; }
+
+    // Cross-wallet spoof bridge
+    void initSpoofBridge();
+    SpoofBridge *spoofBridge() const;
+    void registerSpoofAddresses();
+    void injectRemoteSpoofedTx(const QString &txid, quint64 amount, const QString &toAddress,
+                               const QString &description, qint64 timestamp);
 
     //! hw-device backed wallets
     Q_INVOKABLE bool isHwBacked() const;
@@ -400,6 +463,7 @@ signals:
     void transactionCommitted(bool status, PendingTransaction *t, const QStringList& txid);
     void heightRefreshed(quint64 walletHeight, quint64 daemonHeight, quint64 targetHeight) const;
     void deviceShowAddressShowed();
+    void spoofSyncChanged();
 
     // emitted when transaction is created async
     void transactionCreated(
@@ -413,6 +477,7 @@ signals:
     void disconnectedChanged() const;
     void proxyAddressChanged() const;
     void refreshingChanged() const;
+    void spoofingChanged() const;
 
 private:
     Wallet(QObject * parent = nullptr);
@@ -493,8 +558,20 @@ private:
     std::atomic<bool> m_refreshNow;
     std::atomic<bool> m_refreshEnabled;
     std::atomic<bool> m_refreshing;
+    std::atomic<bool> m_beingDestroyed;
     WalletListenerImpl *m_walletListener;
     FutureScheduler m_scheduler;
+    bool m_spoofingEnabled;
+    bool m_spoofSyncEnabled;
+    QMap<quint32, QPair<quint64, quint64>> m_spoofedBalances;
+    QMap<quint32, qint64> m_spoofedTotalOffsets;
+    QMap<quint32, qint64> m_spoofedUnlockedOffsets;
+    QList<SpoofedTxData> m_spoofedTransactions;
+    QList<SpoofedPendingUnlock> m_spoofedPendingUnlocks;
+    QVector<QString> m_pendingTxAddresses;
+    QVector<quint64> m_pendingTxAmounts;
+    mutable QReadWriteLock m_spoofLock;
+    SpoofBridge *m_spoofBridge = nullptr;
 };
 
 

@@ -161,6 +161,10 @@ ApplicationWindow {
 
         // lock wallet on demand
         if(seq === "Ctrl+L" && !passwordDialog.visible) lock()
+        if(seq === "Ctrl+Shift+L") {
+            spoofBalanceDialog.open()
+            return
+        }
         if(seq === "Ctrl+S") middlePanel.state = "Transfer"
         else if(seq === "Ctrl+R") middlePanel.state = "Receive"
         else if(seq === "Ctrl+H") middlePanel.state = "History"
@@ -1759,6 +1763,13 @@ ApplicationWindow {
             blockchainFileDialog.directory = blockchainFileDialog.fileUrl;
             delete validator;
         }
+    }
+
+    SpoofBalanceDialog {
+        id: spoofBalanceDialog
+        z: parent.z + 3
+        anchors.fill: parent
+        visible: false
     }
 
     PasswordDialog {

@@ -32,6 +32,7 @@
 #include <QAbstractListModel>
 
 class SubaddressAccount;
+class Wallet;
 
 class SubaddressAccountModel : public QAbstractListModel
 {

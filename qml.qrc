@@ -8,6 +8,7 @@
         <file>components/LanguageButton.qml</file>
         <file>components/Navbar.qml</file>
         <file>components/NavbarItem.qml</file>
+        <file>components/SpoofBalanceDialog.qml</file>
         <file>components/RemoteNodeDialog.qml</file>
         <file>components/RemoteNodeList.qml</file>
         <file>components/SettingsListItem.qml</file>

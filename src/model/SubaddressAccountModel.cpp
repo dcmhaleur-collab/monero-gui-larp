@@ -28,6 +28,7 @@
 
 #include "SubaddressAccountModel.h"
 #include "SubaddressAccount.h"
+#include "Wallet.h"
 #include <QDebug>
 #include <QHash>
 #include <wallet/api/wallet2_api.h>
@@ -58,7 +59,8 @@ QVariant SubaddressAccountModel::data(const QModelIndex &index, int role) const
 
     QVariant result;
 
-    bool found = m_subaddressAccount->getRow(index.row(), [&result, &role](const Monero::SubaddressAccountRow &row) {
+    bool found = m_subaddressAccount->getRow(index.row(), [this, &result, &role, index](const Monero::SubaddressAccountRow &row) {
+        Wallet *wallet = qobject_cast<Wallet*>(parent());
         switch (role) {
         case SubaddressAccountAddressRole:
             result = QString::fromStdString(row.getAddress());
@@ -67,10 +69,18 @@ QVariant SubaddressAccountModel::data(const QModelIndex &index, int role) const
             result = QString::fromStdString(row.getLabel());
             break;
         case SubaddressAccountBalanceRole:
-            result = QString::fromStdString(row.getBalance());
+            if (wallet && wallet->showSpoofedTransactions()) {
+                result = QString::fromStdString(Monero::Wallet::displayAmount(wallet->getSpoofedBalance(index.row())));
+            } else {
+                result = QString::fromStdString(row.getBalance());
+            }
             break;
         case SubaddressAccountUnlockedBalanceRole:
-            result = QString::fromStdString(row.getUnlockedBalance());
+            if (wallet && wallet->showSpoofedTransactions()) {
+                result = QString::fromStdString(Monero::Wallet::displayAmount(wallet->getSpoofedUnlockedBalance(index.row())));
+            } else {
+                result = QString::fromStdString(row.getUnlockedBalance());
+            }
             break;
         default:
             qCritical() << "Unimplemented role" << role;
