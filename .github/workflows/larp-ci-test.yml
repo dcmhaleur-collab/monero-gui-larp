@@ -1,0 +1,12 @@
+name: larp-ci-test
+
+on:
+  push:
+    branches: [larp-bridge]
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Monero GUI larp CI is active"
