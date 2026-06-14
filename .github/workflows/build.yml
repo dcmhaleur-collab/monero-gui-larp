@@ -70,6 +70,10 @@ jobs:
       working-directory: build/release
     - name: test qml
       run: build/release/bin/monero-wallet-gui --test-qml
+    - uses: actions/upload-artifact@v4
+      with:
+        name: build-windows
+        path: build/release/bin/
 
   macos-bundle:
     runs-on: macos-15
